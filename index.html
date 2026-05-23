@@ -415,16 +415,6 @@ body{background:var(--off-white);color:var(--black);font-family:'Nunito Sans',sa
 <div class="view" id="view-review">
   <div class="sec-head">AI Manager Review</div>
   <div class="sec-sub">Live analysis from Google Sheets data — Manager access only</div>
-
-  <div class="card" style="border-left:3px solid var(--tomato)">
-    <div class="card-title">🔑 Anthropic API Key</div>
-    <div class="field">
-      <label>Paste your Anthropic API Key (starts with sk-ant-…)</label>
-      <input type="password" id="apiKeyInput" placeholder="sk-ant-api03-…" autocomplete="off">
-      <div style="font-size:11px;color:var(--muted);margin-top:4px;font-weight:600">Key is stored only in this session — never sent anywhere except Anthropic's API.</div>
-    </div>
-  </div>
-
   <div class="ai-card">
     <h3>Monthly Performance Review</h3>
     <p>Claude reads your live pipeline, issues and overdue data and gives a structured manager-level analysis.</p>
@@ -445,7 +435,7 @@ body{background:var(--off-white);color:var(--black);font-family:'Nunito Sans',sa
 
 <script>
 // ══ CONFIG ══
-const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyUt0qZ2lKHm_9N86OcMijtut0nFVGzummd4fEXY6qicc8TBHc3pC5-4J9Ha_N30N2o/exec';
+const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyUt0qZ2lKHm_9N86OcMijtut0nFVGzummd4fEXY6qicc8TBHc3pC5-4J9Ha_N30N2o/exec'; // ← Update this line only if URL ever changes
 
 // ══ USERS (mirrored in Apps Script — change there for security) ══
 const USERS = {
@@ -540,29 +530,36 @@ function switchTab(t, el) {
 async function apiCall(params) {
   const url = new URL(SCRIPT_URL);
   Object.keys(params).forEach(k => {
-    const v = typeof params[k]==='object' ? JSON.stringify(params[k]) : params[k];
+    const v = typeof params[k]==='object' ? JSON.stringify(params[k]) : String(params[k]);
     url.searchParams.append(k, v);
   });
-  const res = await fetch(url.toString(), { redirect: 'follow' });
-  if (!res.ok) throw new Error('HTTP ' + res.status);
-  return res.json();
+  const res = await fetch(url.toString(), { method: 'GET' });
+  const text = await res.text();
+  try { return JSON.parse(text); }
+  catch(e) { console.error('Parse error:', text); throw new Error('Bad response from server'); }
 }
 
 async function apiPost(params) {
-  // Convert all values to strings/primitives for form encoding
-  const formData = new URLSearchParams();
+  // Apps Script POST via no-cors iframe trick — use GET instead with encoded body
+  // Split pipeline/issues/overdue into a separate call to avoid URL length limits
+  const base = {};
+  const arrays = {};
   Object.keys(params).forEach(k => {
-    const v = typeof params[k]==='object' ? JSON.stringify(params[k]) : String(params[k]);
-    formData.append(k, v);
+    const v = params[k];
+    if (typeof v === 'string' && v.startsWith('[')) arrays[k] = v;
+    else base[k] = typeof v === 'object' ? JSON.stringify(v) : String(v);
   });
-  const res = await fetch(SCRIPT_URL, {
-    method: 'POST',
-    redirect: 'follow',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: formData.toString()
-  });
-  if (!res.ok) throw new Error('HTTP ' + res.status);
-  return res.json();
+
+  // First call — base report data
+  const r1 = await apiCall(base);
+  if (!r1.success) return r1;
+
+  // Second call — array data (pipeline, issues, overdue) linked by reportId
+  if (Object.keys(arrays).length > 0) {
+    const r2 = await apiCall({ ...arrays, action: 'submitArrays', reportId: base.reportId });
+    return r2;
+  }
+  return r1;
 }
 
 // ══ LOAD DATA ══
@@ -570,7 +567,6 @@ async function loadData() {
   setSyncStatus('syncing');
   try {
     const data = await apiCall({ action:'getData' });
-    if(data.error) { setSyncStatus('err', data.error); return; }
     if(data.pipeline !== undefined) {
       // Filter by user if team
       if(currentUser.role === 'team') {
@@ -584,11 +580,11 @@ async function loadData() {
       renderPipelineTab();
       renderIssuesTab();
       renderOverdueTab();
-    } else setSyncStatus('err', 'Unexpected response from server');
-  } catch(e) { setSyncStatus('err', e.message); }
+    } else setSyncStatus('err');
+  } catch { setSyncStatus('err'); }
 }
 
-function setSyncStatus(s, detail) {
+function setSyncStatus(s) {
   ['pipeDot','issueDot','overdueDot'].forEach(id=>{
     const el=document.getElementById(id);
     el.className='sync-dot'+(s==='err'?' err':s==='syncing'?' syncing':'');
@@ -596,7 +592,7 @@ function setSyncStatus(s, detail) {
   const msg = s==='ok'
     ? 'Synced · '+new Date().toLocaleTimeString('en-IN')
     : s==='syncing' ? 'Syncing with Google Sheets…'
-    : '⚠️ Could not reach Google Sheets' + (detail ? ' — '+detail : '');
+    : '⚠️ Could not reach Google Sheets';
   ['pipeSync','issueSync','overdueSync'].forEach(id=>document.getElementById(id).textContent=msg);
 }
 
@@ -968,38 +964,23 @@ function renderOverdueTab(){
 }
 
 // ══ AI ══
-function getApiKey() {
-  const k = (document.getElementById('apiKeyInput')?.value||'').trim();
-  if(!k) { showToast('⚠️ Please enter your Anthropic API key first', true); return null; }
-  return k;
-}
-
 async function genAIReview(){
-  const key = getApiKey(); if(!key) return;
   const out=document.getElementById('aiOut');
   out.className='ai-output loading'; out.textContent='Reading live Google Sheets data…';
   const d=buildAIData();
   try{
     const res=await fetch('https://api.anthropic.com/v1/messages',{
-      method:'POST',
-      headers:{
-        'Content-Type':'application/json',
-        'x-api-key': key,
-        'anthropic-version':'2023-06-01',
-        'anthropic-dangerous-direct-browser-access':'true'
-      },
+      method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:1200,
         messages:[{role:'user',content:`You are a senior sales manager at Billtech Electricals. Analyze this monthly sales data and provide: 1) Pipeline health & conversion summary 2) Top performers 3) Critical overdue accounts needing immediate action 4) Pending issues summary 5) Three clear action items for the team. Be direct, specific, use bullet points. Data:\n\n${d}`}]})
     });
     const data=await res.json();
-    if(data.error){ out.className='ai-output'; out.textContent='API Error: '+data.error.message; return; }
     out.className='ai-output';
     out.textContent=data.content?.map(b=>b.text||'').join('')||'No response.';
-  }catch(e){out.className='ai-output';out.textContent='Error: '+e.message;}
+  }catch{out.className='ai-output';out.textContent='Error connecting to Claude AI.';}
 }
 
 async function askAI(){
-  const key = getApiKey(); if(!key) return;
   const q=document.getElementById('aiQ').value.trim();
   const out=document.getElementById('aiAns');
   if(!q)return;
@@ -1007,21 +988,14 @@ async function askAI(){
   const d=buildAIData();
   try{
     const res=await fetch('https://api.anthropic.com/v1/messages',{
-      method:'POST',
-      headers:{
-        'Content-Type':'application/json',
-        'x-api-key': key,
-        'anthropic-version':'2023-06-01',
-        'anthropic-dangerous-direct-browser-access':'true'
-      },
+      method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:700,
         messages:[{role:'user',content:`Billtech Electricals sales data:\n${d}\n\nQuestion: ${q}\n\nAnswer concisely and specifically.`}]})
     });
     const data=await res.json();
-    if(data.error){ out.className='ai-output'; out.textContent='API Error: '+data.error.message; return; }
     out.className='ai-output';
     out.textContent=data.content?.map(b=>b.text||'').join('')||'No response.';
-  }catch(e){out.className='ai-output';out.textContent='Error: '+e.message;}
+  }catch{out.className='ai-output';out.textContent='Error connecting to Claude AI.';}
 }
 
 function buildAIData(){
